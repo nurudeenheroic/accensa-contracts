@@ -8,23 +8,29 @@ This document outlines the threat model, trust assumptions, and attack mitigatio
 
 ## Trust Assumptions
 
-### 0. Immutability of Deployed Contracts
-
-Both `ReceiptAnchor` and `RefundVault` are **immutable**: they contain no upgrade
-entry point and no call to `update_current_contract_wasm`. This is a deliberate
-security property, not an omission — see
-[ADR 003](ADR-003-upgradeability.md).
+### 0. Immutability and Upgradeability Posture
+ 
+While `ReceiptAnchor` is **immutable** (containing no upgrade entry point and no
+call to `update_current_contract_wasm`), `RefundVault` is **admin-upgradeable**
+via a deliberate two-phase migration and upgrade flow (`migrate_state` and
+`upgrade_wasm`, calling `env.deployer().update_current_contract_wasm`). This
+differentiated posture is documented in [ADR 003](ADR-003-upgradeability.md) and
+[REFUND_VAULT_MIGRATION.md](REFUND_VAULT_MIGRATION.md).
 
 Consequences for the threat model:
-- **No admin — including the operator — can change contract behaviour after
-deployment.** A merchant can withdraw float, pause/unpause, and (via the two-step
-transfer) hand over admin, but cannot install new rules or alter the refund policy
-or anchoring behaviour.
-- **A compromised admin key cannot rewrite wasm.** Its blast radius is bounded by
-the authorisation surface the contract already encodes (drain float, pause, refund
-within policy).
-- **Bugs are permanent at a deployed address.** The response to a logic defect is
-withdraw-and-redeploy per the migration runbook in ADR 003, not an in-place patch.
+- **ReceiptAnchor cannot be altered post-deployment.** Anchored Merkle roots and
+  historic payment attestations are permanently anchored; a logic defect or
+  interface change requires deploying a new anchor instance.
+- **RefundVault logic can be upgraded only by the authenticated Admin.** Both
+  `migrate_state` and `upgrade_wasm` strictly require `admin.require_auth()`. A
+  compromised admin key can authorize a WASM upgrade in addition to standard admin
+  powers (withdrawing float, pausing, configuring policy/windows/yield). This
+  amplifies the critical importance of admin key custody, multisig administration,
+  and cold storage governance (see §1).
+- **In-place state migrations on RefundVault must preserve integrity.** Upgrades
+  must adhere to the two-phase runbook in `docs/REFUND_VAULT_MIGRATION.md`: pause
+  activity, call `migrate_state` to monotonically advance storage versioning and
+  validate invariants, execute `upgrade_wasm`, and verify balances before unpausing.
 
 ### 1. The Admin (Merchant)
 The admin is assumed to be a trusted entity in the context of configuring the contract. They are responsible for:
@@ -39,7 +45,7 @@ If the admin's private key is compromised, the attacker could drain the vault's 
 store a single `Address` as `Admin` and put no constraint on what it is, so a
 `RefundVault` or `ReceiptAnchor` initialised with a multisig contract account as
 its merchant already requires that account's threshold of signers for `pause`,
-`unpause`, `set_refund_window`, `refund`, `withdraw`, `anchor_batch` and
+`unpause`, `propose_policy`, `execute_policy`, `refund`, `withdraw`, `anchor_batch` and
 `prune_batches` — with no threshold logic in this repository. This is covered by
 tests in `contracts/refund-vault/tests/multisig_admin_vault.rs` and
 `contracts/receipt-anchor/tests/multisig_admin_anchor.rs` (see
@@ -80,6 +86,40 @@ trusted to that strategy's contract. The vault enforces reserve and deployment
 ratios but cannot enforce strategy solvency, and the strategy is a potential
 re-entrancy surface. See [AUDIT.md](AUDIT.md) §2 and §5 for the full treatment.
 
+### 6. The Oracle Aggregator (optional)
+The `RefundVault` oracle integration (for dynamic, SLA-based refund policies)
+adds one more trust assumption: the **median** of the values reported by the
+merchant-whitelisted oracles is treated as ground truth for the configured
+feed. The design deliberately avoids trusting any single provider:
+
+- The whitelist is merchant-maintained (`add_oracle` / `remove_oracle`),
+  same trust tier as the yield strategy — a whitelisted oracle is a
+  merchant-chosen counterparty, and a *compromised* one can only contribute
+  one value to the aggregate.
+- The aggregator queries **every** whitelisted oracle and takes the median
+  of the fresh values, so moving the aggregated price requires controlling a
+  majority of the whitelist, not one member. A single wildly-wrong value
+  (e.g. a buggy or exploited provider) is neutralised.
+- **Staleness filtering**: a value older than the policy's
+  `max_staleness_ledgers` is excluded from the median, so a provider that
+  stopped updating cannot hold the aggregate hostage at an old price.
+- **Fail closed**: with no whitelist, or with every whitelisted oracle stale,
+  the policy cannot be evaluated and `refund` rejects (`NoOraclesConfigured`
+  / `StaleOracleData`) instead of guessing. A refund whose condition is not
+  met is rejected with `OraclePolicyDenied`.
+- **No catch for a panicking oracle**: a whitelisted oracle that aborts
+  during `get_price` aborts the whole transaction (Soroban has no
+  cross-contract catch). This is deliberate fail-closed behaviour — the
+  merchant must remove the broken oracle.
+- The oracle queries run inside `refund`'s reentrancy lock (the policy check
+  sits in `refund_internal`, which `refund` reaches with the guard held), so
+  a whitelisted oracle cannot re-enter the vault from its `get_price`
+  callback.
+
+The `OraclePolicy` (feed, threshold, staleness bound, comparison direction)
+is merchant-configured and can be cleared at any time to restore purely
+window-based refunds.
+
 ## Attack Vectors and Mitigations
 
 ### Replay Attacks
@@ -106,9 +146,40 @@ re-entrancy surface. See [AUDIT.md](AUDIT.md) §2 and §5 for the full treatment
   simply never restored — causes `refund` to fail closed (a host trap on
   accessing an archived entry) or fail open (a stale read). The test host
   auto-heals expired entries rather than modeling archival, so it cannot
-  distinguish the two. Treat this as an open item for anyone auditing against
-  testnet/mainnet directly, and see #122 for a nonce-based alternative that
-  would not depend on the answer either way.
+  distinguish the two. As belt-and-suspenders for the same threat, every
+  claim entry point carries a **per-user nonce** (see below), so a request
+  cannot be replayed regardless of how the guard behaves around archival.
+- **Per-user nonce (issue #122):** each `refund`, `claim_batch`, and
+  `process_batch` call must present a `nonce` that exactly equals the
+  caller's (the merchant's) stored counter, which starts at `0` and
+  increments by one on every *successful* claim call
+  (`get_user_nonce` exposes the expected next value). Failure to match —
+  whether a replay of an already-consumed nonce or a skipped one — reverts
+  the whole call with `Error::StaleState`, mirroring the state channel's
+  nonce-replay semantics. Because the nonce check runs inside the call,
+  before the payment executes, a failed claim reverts atomically and does
+  *not* consume a nonce; an empty `process_batch` returns early and
+  deliberately consumes none. This is complementary to (not a substitute
+  for) the cumulative `RefundV2` ceiling: the ceiling stops a payment from
+  being double-refunded, while the nonce stops an identical signed refund
+  *request* from being submitted twice — e.g. through an RPC endpoint or
+  facilitator that retries or replays transactions.
+
+### Anchor Spam / Storage Bloat
+- **Threat:** A malicious actor (or a compromised merchant key) submits a
+  flood of valid-but-useless `anchor_batch` calls, bloating persistent
+  storage with batch records and driving up rent and fees for legitimate
+  users. Network fees deter this but do not stop a targeted attack.
+- **Mitigation:** `ReceiptAnchor` runs a per-identity **token bucket**
+  rate limiter, configured by the admin via `set_anchor_rate_limit`. Each
+  identity (the merchant, since `anchor_batch` is merchant-authorized) may
+  submit `burst_capacity` anchors back-to-back; the bucket then refills one
+  token every `refill_interval_secs` seconds, and a submission with an empty
+  bucket is rejected with `AnchorRateLimited` **before** any storage is
+  written or any shard is deployed — the check is read-only, so a rejected
+  spam transaction costs the attacker the fee without touching state.
+  Rate limiting is disabled by default (`{0, 0}`) and adds no storage when
+  off; when on, it costs one 12-byte persistent entry per identity.
 
 ### Proof Forgery
 - **Threat:** An attacker tries to claim a refund for a non-existent or altered receipt.
@@ -147,13 +218,19 @@ re-entrancy surface. See [AUDIT.md](AUDIT.md) §2 and §5 for the full treatment
   `contracts/refund-vault/src/vdf.rs` stays unknown — anyone who factors `N`
   can compute `x^(2^T) mod N` in `O(log T)` steps via `phi(N)`. The constant
   shipped in this release was generated for the source release with its prime
-  factors discarded after generation; because the contracts are immutable,
-  rotating the modulus requires a new deployment (ADR 003). A production
+  factors discarded after generation; rotating the modulus requires either a
+  WASM upgrade via `upgrade_wasm` on `RefundVault` (per ADR 003 and
+  `docs/REFUND_VAULT_MIGRATION.md`) or a new deployment. A production
   deployment should replace `MODULUS` with one from a trusted-setup ceremony
   (ideally ≥2048 bits, which would require a larger big-int implementation
   than the SDK's 256-bit host integers — the 1024-bit arithmetic here is pure
   WASM). Treat the shipped modulus as a testnet-grade placeholder, not a
   mainnet parameter.
+
+### Zero Window Semantics (Unbounded Window)
+- **Design & Posture:** Setting a refund window of `0` in `initialize` (or via timelocked `propose_policy` / `execute_policy`) is permitted by design and explicitly represents an **unbounded window** (no time limit on refund claims). The contract does not reject `window == 0`.
+- **TTL Guard Handling:** When `window == 0`, `claim_single` bypasses the time-window expiration check, and `refund_record_ttl_extend_to` (in `contracts/refund-vault/src/lib.rs`) extends the `RefundV2` persistent entry to the network's `max_ttl()`. This prevents the anti-replay tombstone of an unbounded policy from expiring prematurely while claims remain valid.
+- **Verification:** Proven by unit tests `test_zero_window_disables_expiry` and `test_zero_window_extends_guard_to_max_ttl` in `contracts/refund-vault/src/test.rs`. The getter `get_refund_window` returns `0` when no time limit is imposed.
 
 ### Float Draining (Negative/Zero Amounts)
 - **Threat:** An attacker tries to refund a negative amount to cause an underflow or steal funds.
@@ -198,6 +275,5 @@ For Classic Stellar assets wrapped in a Stellar Asset Contract (like USDC), the 
 ## Vulnerability Reporting
 
 If you discover a vulnerability that breaks any of the security properties or
-mitigations described in this document, please follow our private disclosure
+nitigations described in this document, please follow our private disclosure
 guidelines in [SECURITY.md](../SECURITY.md).
-

@@ -25,6 +25,7 @@ use soroban_sdk::{
     BytesN, Env,
 };
 
+use crate::test_helpers::vault_init;
 use crate::{Error, RefundVault, RefundVaultClient};
 
 const FLOAT: i128 = 1_000_000;
@@ -136,9 +137,8 @@ fn setup_with_token_and_float(decimals: u32, float: i128) -> VaultWithToken {
     MockSep41TokenClient::new(&env, &token_id).initialize(&token_admin, &decimals);
     MockSep41TokenClient::new(&env, &token_id).mint(&merchant, &float);
 
-    let vault_id = env.register(RefundVault, ());
+    let vault_id = env.register(RefundVault, (vault_init(&env, &merchant, &token, 100),));
     let client = RefundVaultClient::new(&env, &vault_id);
-    client.initialize(&merchant, &token.clone(), &100);
 
     let token_client = TokenClient::new(&env, &token);
     VaultWithToken {
@@ -168,14 +168,14 @@ fn test_full_lifecycle_with_zero_decimal_token() {
     assert_eq!(token_client.decimals(), 0);
 
     // Deposit: the merchant funds the float in whole-token units.
-    client.deposit(&merchant, &1_000);
+    client.deposit(&merchant, &1_000, &None);
     assert_eq!(token_client.balance(&client.address), 1_000);
     assert_eq!(token_client.balance(&merchant), FLOAT - 1_000);
 
     // Refund the smallest representable unit (1) to a buyer.
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &1, &0, &1, &None);
+    client.refund(&payment_ref, &buyer, &1, &0, &1, &None, &0);
     assert_eq!(token_client.balance(&buyer), 1);
     assert_eq!(token_client.balance(&client.address), 999);
 
@@ -197,13 +197,13 @@ fn test_full_lifecycle_with_two_decimal_token() {
     assert_eq!(token_client.decimals(), 2);
 
     // 12_345 units == 123.45 whole tokens at 2 decimals.
-    client.deposit(&merchant, &12_345);
+    client.deposit(&merchant, &12_345, &None);
     assert_eq!(token_client.balance(&client.address), 12_345);
 
     // Refund 0.45 tokens, then withdraw the remaining 123.00 tokens.
     let payment_ref = BytesN::from_array(&env, &[8u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &45, &0, &45, &None);
+    client.refund(&payment_ref, &buyer, &45, &0, &45, &None, &0);
     client.withdraw(&12_300, &merchant);
 
     assert_eq!(token_client.balance(&buyer), 45);
@@ -219,13 +219,13 @@ fn test_float_bound_check_with_non_7_decimal_token() {
         token_client: _,
     } = setup_with_token(0);
 
-    client.deposit(&merchant, &100);
+    client.deposit(&merchant, &100, &None);
 
     // The float-bound check compares raw units, exactly as it does for the SAC.
     let payment_ref = BytesN::from_array(&env, &[14u8; 32]);
     let buyer = Address::generate(&env);
     assert_eq!(
-        client.try_refund(&payment_ref, &buyer, &101, &0, &101, &None),
+        client.try_refund(&payment_ref, &buyer, &101, &0, &101, &None, &0),
         Err(Ok(Error::InsufficientFloat))
     );
 }
@@ -241,18 +241,18 @@ fn test_refund_exactly_equal_to_float_succeeds() {
         token_client,
     } = setup_with_token(0);
 
-    client.deposit(&merchant, &1_000);
+    client.deposit(&merchant, &1_000, &None);
 
     // A refund equal to the entire float is allowed...
     let payment_ref = BytesN::from_array(&env, &[9u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &1_000, &0, &1_000, &None);
+    client.refund(&payment_ref, &buyer, &1_000, &0, &1_000, &None, &0);
     assert_eq!(token_client.balance(&client.address), 0);
 
     // ...and any further refund is bounded by the now-empty float.
     let payment_ref2 = BytesN::from_array(&env, &[10u8; 32]);
     assert_eq!(
-        client.try_refund(&payment_ref2, &buyer, &1, &0, &1, &None),
+        client.try_refund(&payment_ref2, &buyer, &1, &0, &1, &None, &1),
         Err(Ok(Error::InsufficientFloat))
     );
 }
@@ -268,12 +268,12 @@ fn test_smallest_unit_round_trip() {
 
     // 1 is the smallest representable unit of a 0-decimal token; the vault must
     // handle it in every direction (deposit, refund, withdraw).
-    client.deposit(&merchant, &2);
+    client.deposit(&merchant, &2, &None);
     assert_eq!(token_client.balance(&client.address), 2);
 
     let payment_ref = BytesN::from_array(&env, &[11u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &1, &0, &1, &None);
+    client.refund(&payment_ref, &buyer, &1, &0, &1, &None, &0);
     assert_eq!(token_client.balance(&buyer), 1);
 
     client.withdraw(&1, &merchant);
@@ -290,7 +290,7 @@ fn test_i128_extreme_deposit_and_withdraw() {
         token_client,
     } = setup_with_token_and_float(0, extreme);
 
-    client.deposit(&merchant, &extreme);
+    client.deposit(&merchant, &extreme, &None);
     assert_eq!(token_client.balance(&client.address), extreme);
 
     // Withdraw the full i128 range to a third party.
@@ -310,20 +310,20 @@ fn test_i128_extreme_refund() {
         token_client,
     } = setup_with_token_and_float(0, extreme);
 
-    client.deposit(&merchant, &extreme);
+    client.deposit(&merchant, &extreme, &None);
 
     // A refund of the entire i128 range — the vault must not overflow or
     // miscompare at the boundary of its integer type.
     let payment_ref = BytesN::from_array(&env, &[12u8; 32]);
     let buyer = Address::generate(&env);
-    client.refund(&payment_ref, &buyer, &extreme, &0, &extreme, &None);
+    client.refund(&payment_ref, &buyer, &extreme, &0, &extreme, &None, &0);
     assert_eq!(token_client.balance(&buyer), extreme);
     assert_eq!(token_client.balance(&client.address), 0);
 
     // One unit over the empty float is rejected by the bound check.
     let payment_ref2 = BytesN::from_array(&env, &[13u8; 32]);
     assert_eq!(
-        client.try_refund(&payment_ref2, &buyer, &1, &0, &1, &None),
+        client.try_refund(&payment_ref2, &buyer, &1, &0, &1, &None, &1),
         Err(Ok(Error::InsufficientFloat))
     );
 }

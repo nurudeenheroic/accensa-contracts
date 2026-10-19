@@ -1,15 +1,22 @@
 #![cfg(test)]
 
+use accensa_common::VaultInit;
 use receipt_anchor::{ReceiptAnchor, ReceiptAnchorClient};
+use refund_policy_time::TimePolicy;
+use refund_policy_vdf::VdfPolicy;
 use refund_vault::{RefundVault, RefundVaultClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token::StellarAssetClient,
-    vec, Address, Bytes, BytesN, Env,
+    contract, contractimpl, contracttype,
+    testutils::{Address as _, Events, Ledger},
+    token::{StellarAssetClient, TokenClient},
+    vec, Address, Bytes, BytesN, Env, Event,
 };
 
 const FLOAT: i128 = 1_000_000;
 const WINDOW: u32 = 100;
+
+/// Logical shard used by these receipt integration tests (single-stream).
+const DEFAULT_SHARD: u64 = 0;
 
 /// The `ReceiptShard` wasm, built by `cargo build -p receipt-shard --target
 /// wasm32v1-none --release` before these tests run (see
@@ -44,9 +51,8 @@ fn setup<'a>() -> TestEnv<'a> {
     let shard_wasm_hash = env.deployer().upload_contract_wasm(shard_wasm::WASM);
     anchor.initialize(&merchant, &shard_wasm_hash);
 
-    let vault_id = env.register(RefundVault, ());
+    let vault_id = env.register(RefundVault, (vault_init(&env, &merchant, &token),));
     let vault = RefundVaultClient::new(&env, &vault_id);
-    vault.initialize(&merchant, &token, &WINDOW);
 
     // Initial sequence number
     env.ledger().with_mut(|li| li.sequence_number = 10);
@@ -58,6 +64,231 @@ fn setup<'a>() -> TestEnv<'a> {
         merchant,
         token,
     }
+}
+
+fn vault_init(env: &Env, merchant: &Address, token: &Address) -> VaultInit {
+    VaultInit {
+        merchant: merchant.clone(),
+        token: token.clone(),
+        time_policy: Some(env.register(TimePolicy, ())),
+        vdf_policy: Some(env.register(VdfPolicy, ())),
+        fee_bps: 0,
+        fee_recipient: None,
+        refund_window: WINDOW,
+        deadline: 0,
+        vdf_delay: 0,
+    }
+}
+
+#[contract]
+struct IntegrationNft;
+
+#[contracttype]
+#[derive(Clone, Copy)]
+enum IntegrationNftKey {
+    Admin,
+    Owner(u128),
+}
+
+#[contractimpl]
+impl IntegrationNft {
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage()
+            .instance()
+            .set(&IntegrationNftKey::Admin, &admin);
+    }
+
+    pub fn mint(env: Env, to: Address, token_id: u128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&IntegrationNftKey::Admin)
+            .unwrap();
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&IntegrationNftKey::Owner(token_id), &to);
+    }
+
+    pub fn owner(env: Env, token_id: u128) -> Address {
+        env.storage()
+            .persistent()
+            .get(&IntegrationNftKey::Owner(token_id))
+            .unwrap()
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, token_id: u128) {
+        from.require_auth();
+        let key = IntegrationNftKey::Owner(token_id);
+        let owner: Address = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(owner, from);
+        env.storage().persistent().set(&key, &to);
+    }
+}
+
+#[contract]
+struct IntegrationYieldStrategy;
+
+#[contracttype]
+#[derive(Clone, Copy)]
+enum IntegrationStrategyKey {
+    Token,
+    Vault,
+    Principal,
+    Yield,
+    ShortPay,
+}
+
+#[contractimpl]
+impl IntegrationYieldStrategy {
+    pub fn initialize(env: Env, token: Address, vault: Address) {
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Vault, &vault);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Principal, &0i128);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Yield, &0i128);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::ShortPay, &false);
+    }
+
+    pub fn set_short_pay(env: Env, enabled: bool) {
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::ShortPay, &enabled);
+    }
+
+    pub fn simulate_yield(env: Env, amount: i128) {
+        let accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Yield)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Yield, &(accrued + amount));
+    }
+
+    pub fn deposit(env: Env, amount: i128) -> Result<(), accensa_common::Error> {
+        let principal: i128 = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Principal)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Principal, &(principal + amount));
+        Ok(())
+    }
+
+    pub fn withdraw(env: Env, principal: i128) -> Result<(i128, i128), accensa_common::Error> {
+        let deployed: i128 = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Principal)
+            .unwrap_or(0);
+        if principal <= 0 || principal > deployed {
+            return Err(accensa_common::Error::NothingToWithdraw);
+        }
+
+        let accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Yield)
+            .unwrap_or(0);
+        let yield_returned = accrued * principal / deployed;
+        let short_pay: bool = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::ShortPay)
+            .unwrap_or(false);
+        if !short_pay {
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&IntegrationStrategyKey::Token)
+                .unwrap();
+            let vault: Address = env
+                .storage()
+                .instance()
+                .get(&IntegrationStrategyKey::Vault)
+                .unwrap();
+            TokenClient::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &vault,
+                &(principal + yield_returned),
+            );
+        }
+
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Principal, &(deployed - principal));
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Yield, &(accrued - yield_returned));
+        Ok((principal, yield_returned))
+    }
+
+    pub fn harvest(env: Env) -> Result<i128, accensa_common::Error> {
+        let accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Yield)
+            .unwrap_or(0);
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Token)
+            .unwrap();
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Vault)
+            .unwrap();
+        TokenClient::new(&env, &token).transfer(&env.current_contract_address(), &vault, &accrued);
+        env.storage()
+            .instance()
+            .set(&IntegrationStrategyKey::Yield, &0i128);
+        Ok(accrued)
+    }
+
+    pub fn total_balance(env: Env) -> i128 {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Token)
+            .unwrap();
+        TokenClient::new(&env, &token).balance(&env.current_contract_address())
+    }
+
+    pub fn accrued_yield(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&IntegrationStrategyKey::Yield)
+            .unwrap_or(0)
+    }
+}
+
+fn register_nft(test_env: &TestEnv) -> Address {
+    let nft = test_env.env.register(IntegrationNft, ());
+    IntegrationNftClient::new(&test_env.env, &nft).initialize(&test_env.merchant);
+    nft
+}
+
+fn register_strategy(test_env: &TestEnv) -> Address {
+    let strategy = test_env.env.register(IntegrationYieldStrategy, ());
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy)
+        .initialize(&test_env.token, &test_env.vault.address);
+    test_env.vault.approve_yield_strategy(&strategy);
+    test_env.vault.set_yield_strategy(&strategy);
+    strategy
 }
 
 // Helper to hash two children (sorted-pair)
@@ -93,18 +324,21 @@ fn readme_claim_refunds_outlive_pruned_batches() {
     // Anchor a single-leaf batch.
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let leaf = payment_ref.clone();
-    anchor.anchor_batch(&leaf.clone(), &1, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &leaf.clone(), &1, &0, &100);
 
     // Fast-forward and prune the batch (anchored at ledger 10, so prune < 150).
     env.ledger().with_mut(|li| li.sequence_number = 200);
-    anchor.prune_batches(&150);
-    assert!(anchor.try_get_batch(&1).is_err(), "batch should be pruned");
+    anchor.prune_batches(&DEFAULT_SHARD, &150);
+    assert!(
+        anchor.try_get_batch(&DEFAULT_SHARD, &1).is_err(),
+        "batch should be pruned"
+    );
 
     // The vault is unaffected: refunding the same payment_ref still works,
     // provided it falls within the refund window (paid_at_ledger >= 100 here).
-    vault.deposit(&merchant, &500_000);
+    vault.deposit(&merchant, &500_000, &None);
     let buyer = Address::generate(&env);
-    vault.refund(&payment_ref, &buyer, &100, &150, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &150, &100, &None, &0);
 
     let record = vault.get_refund(&payment_ref).unwrap();
     assert_eq!(record.amount_refunded, 100);
@@ -129,17 +363,17 @@ fn readme_claim_payment_ref_is_receipt_leaf() {
     let sibling = BytesN::from_array(&env, &[10u8; 32]);
     let root = hash_pair(&env, &leaf, &sibling);
 
-    anchor.anchor_batch(&root, &2, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &2, &0, &100);
     let proof = vec![&env, sibling.clone()];
-    assert!(anchor.verify_receipt(&1, &leaf, &proof));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &leaf, &proof));
 
-    vault.deposit(&merchant, &500_000);
+    vault.deposit(&merchant, &500_000, &None);
     let buyer = Address::generate(&env);
-    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None, &0);
 
     // Both contracts agree: verify_receipt accepts the leaf and get_refund
     // returns a record keyed by the same bytes.
-    assert!(anchor.verify_receipt(&1, &leaf, &proof));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &leaf, &proof));
     assert_eq!(vault.get_refund(&payment_ref).unwrap().amount_refunded, 100);
 }
 
@@ -162,15 +396,15 @@ fn test_happy_path_and_payment_ref_correspondence() {
     let sibling = BytesN::from_array(&env, &[8u8; 32]);
     let root = hash_pair(&env, &leaf, &sibling);
 
-    anchor.anchor_batch(&root, &2, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &2, &0, &100);
     let proof = vec![&env, sibling.clone()];
-    assert!(anchor.verify_receipt(&1, &leaf, &proof));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &leaf, &proof));
 
-    vault.deposit(&merchant, &500_000);
+    vault.deposit(&merchant, &500_000, &None);
     let buyer = Address::generate(&env);
-    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None, &0);
 
-    assert!(anchor.verify_receipt(&1, &leaf, &proof));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &leaf, &proof));
     assert_eq!(vault.get_refund(&payment_ref).unwrap().amount_refunded, 100);
 }
 
@@ -188,15 +422,15 @@ fn test_refund_of_payment_in_pruned_batch() {
     let leaf = payment_ref.clone();
 
     let root = leaf.clone();
-    anchor.anchor_batch(&root, &1, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &1, &0, &100);
 
     env.ledger().with_mut(|li| li.sequence_number = 200);
-    anchor.prune_batches(&150);
-    assert!(anchor.try_get_batch(&1).is_err());
+    anchor.prune_batches(&DEFAULT_SHARD, &150);
+    assert!(anchor.try_get_batch(&DEFAULT_SHARD, &1).is_err());
 
-    vault.deposit(&merchant, &500_000);
+    vault.deposit(&merchant, &500_000, &None);
     let buyer = Address::generate(&env);
-    vault.refund(&payment_ref, &buyer, &100, &150, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &150, &100, &None, &0);
 
     assert_eq!(vault.get_refund(&payment_ref).unwrap().amount_refunded, 100);
 }
@@ -216,17 +450,17 @@ fn test_full_refund_then_exceed_payment() {
     let leaf = payment_ref.clone();
 
     let root = leaf.clone();
-    anchor.anchor_batch(&root, &1, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &1, &0, &100);
 
-    vault.deposit(&merchant, &500_000);
+    vault.deposit(&merchant, &500_000, &None);
     let buyer = Address::generate(&env);
 
     // First refund takes a partial; a second past the ceiling is rejected.
-    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None, &0);
     assert_eq!(vault.get_refund(&payment_ref).unwrap().amount_refunded, 100);
 
     // Over the ceiling -> Error(Contract, #19) ExceedsPayment.
-    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None, &1);
 }
 
 #[test]
@@ -244,14 +478,14 @@ fn test_pause_interaction() {
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let buyer = Address::generate(&env);
     assert!(vault
-        .try_refund(&payment_ref, &buyer, &100, &0, &100, &None)
+        .try_refund(&payment_ref, &buyer, &100, &0, &100, &None, &0)
         .is_err());
 
     let root = payment_ref.clone();
-    anchor.anchor_batch(&root, &1, &0, &100);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &1, &0, &100);
 
     let proof = vec![&env];
-    assert!(anchor.verify_receipt(&1, &payment_ref, &proof));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &payment_ref, &proof));
 }
 
 #[test]
@@ -267,15 +501,231 @@ fn test_ttl_archival_across_both() {
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let root = payment_ref.clone();
 
-    anchor.anchor_batch(&root, &1, &0, &100);
-    vault.deposit(&merchant, &500_000);
+    anchor.anchor_batch(&DEFAULT_SHARD, &root, &1, &0, &100);
+    vault.deposit(&merchant, &500_000, &None);
 
     let buyer = Address::generate(&env);
-    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None);
+    vault.refund(&payment_ref, &buyer, &100, &0, &100, &None, &0);
 
-    anchor.extend_batch_ttl(&1);
+    anchor.extend_batch_ttl(&DEFAULT_SHARD, &1);
     vault.extend_refund_ttl(&payment_ref);
 
-    assert!(anchor.verify_receipt(&1, &payment_ref, &vec![&env]));
+    assert!(anchor.verify_receipt(&DEFAULT_SHARD, &1, &payment_ref, &vec![&env]));
     assert_eq!(vault.get_refund(&payment_ref).unwrap().amount_refunded, 100);
+}
+
+#[test]
+fn nft_transfer_moves_the_escrowed_token_to_the_buyer() {
+    let test_env = setup();
+    let nft = register_nft(&test_env);
+    let buyer = Address::generate(&test_env.env);
+    let token_id = 709u128;
+
+    IntegrationNftClient::new(&test_env.env, &nft).mint(&test_env.merchant, &token_id);
+    test_env
+        .vault
+        .deposit_nft(&test_env.merchant, &buyer, &nft, &token_id);
+
+    assert_eq!(
+        IntegrationNftClient::new(&test_env.env, &nft).owner(&token_id),
+        test_env.vault.address
+    );
+    let escrow = test_env.vault.get_nft_escrow(&nft, &token_id).unwrap();
+    assert_eq!(escrow.merchant, test_env.merchant);
+    assert_eq!(escrow.buyer, buyer);
+
+    assert_eq!(test_env.vault.refund_nft(&buyer, &nft, &token_id), token_id);
+    assert_eq!(
+        IntegrationNftClient::new(&test_env.env, &nft).owner(&token_id),
+        buyer
+    );
+    assert!(test_env.vault.get_nft_escrow(&nft, &token_id).is_none());
+}
+
+#[test]
+fn nft_transfer_lifecycle_errors_return_exact_variants() {
+    let test_env = setup();
+    let nft = register_nft(&test_env);
+    let buyer = Address::generate(&test_env.env);
+    let stranger = Address::generate(&test_env.env);
+    let token_id = 710u128;
+
+    assert_eq!(
+        test_env
+            .vault
+            .try_claim_nft(&test_env.merchant, &nft, &token_id),
+        Err(Ok(accensa_common::Error::NftEscrowNotFound))
+    );
+
+    IntegrationNftClient::new(&test_env.env, &nft).mint(&test_env.merchant, &token_id);
+    test_env
+        .vault
+        .deposit_nft(&test_env.merchant, &buyer, &nft, &token_id);
+
+    assert_eq!(
+        test_env
+            .vault
+            .try_deposit_nft(&test_env.merchant, &buyer, &nft, &token_id),
+        Err(Ok(accensa_common::Error::NftAlreadyEscrowed))
+    );
+    assert_eq!(
+        test_env.vault.try_refund_nft(&stranger, &nft, &token_id),
+        Err(Ok(accensa_common::Error::Unauthorized))
+    );
+    assert_eq!(
+        IntegrationNftClient::new(&test_env.env, &nft).owner(&token_id),
+        test_env.vault.address
+    );
+
+    IntegrationNftClient::new(&test_env.env, &nft).transfer(
+        &test_env.vault.address,
+        &stranger,
+        &token_id,
+    );
+    assert_eq!(
+        test_env
+            .vault
+            .try_claim_nft(&test_env.merchant, &nft, &token_id),
+        Err(Ok(accensa_common::Error::NftNotOwned))
+    );
+    assert!(test_env.vault.get_nft_escrow(&nft, &token_id).is_some());
+}
+
+#[test]
+fn emergency_exit_recalls_all_principal_and_works_while_paused() {
+    let test_env = setup();
+    let strategy = register_strategy(&test_env);
+    let amount = 300_000i128;
+    let yield_amount = 30_000i128;
+
+    test_env.vault.deposit(&test_env.merchant, &400_000, &None);
+    test_env.vault.deploy_to_yield(&amount);
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy).simulate_yield(&yield_amount);
+    StellarAssetClient::new(&test_env.env, &test_env.token).mint(&strategy, &yield_amount);
+    test_env.vault.pause();
+
+    assert_eq!(test_env.vault.emergency_exit_yield(), amount);
+
+    let info = test_env.vault.get_yield_info();
+    assert_eq!(info.deployed_principal, 0);
+    assert_eq!(info.harvested_yield, yield_amount);
+    assert_eq!(
+        TokenClient::new(&test_env.env, &test_env.token).balance(&test_env.vault.address),
+        430_000
+    );
+    assert_eq!(
+        TokenClient::new(&test_env.env, &test_env.token).balance(&strategy),
+        0
+    );
+    assert!(test_env.vault.is_paused());
+}
+
+#[test]
+fn emergency_exit_errors_are_specific() {
+    let test_env = setup();
+    assert_eq!(
+        test_env.vault.try_emergency_exit_yield(),
+        Err(Ok(accensa_common::Error::StrategyNotSet))
+    );
+
+    let strategy = register_strategy(&test_env);
+    assert_eq!(
+        test_env.vault.try_emergency_exit_yield(),
+        Err(Ok(accensa_common::Error::NothingToWithdraw))
+    );
+
+    test_env.vault.deposit(&test_env.merchant, &250_000, &None);
+    test_env.vault.deploy_to_yield(&250_000);
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy).set_short_pay(&true);
+    assert_eq!(
+        test_env.vault.try_emergency_exit_yield(),
+        Err(Ok(accensa_common::Error::InsufficientFloat))
+    );
+    assert_eq!(test_env.vault.get_yield_info().deployed_principal, 250_000);
+}
+
+#[test]
+fn distribute_pays_harvested_yield_and_emits_event() {
+    let test_env = setup();
+    let strategy = register_strategy(&test_env);
+    let recipient = Address::generate(&test_env.env);
+    let yield_amount = 25_000i128;
+
+    test_env.vault.deposit(&test_env.merchant, &400_000, &None);
+    test_env.vault.deploy_to_yield(&400_000);
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy).simulate_yield(&yield_amount);
+    StellarAssetClient::new(&test_env.env, &test_env.token).mint(&strategy, &yield_amount);
+    test_env.vault.harvest_yield();
+    test_env.vault.set_yield_recipient(&recipient);
+
+    assert_eq!(test_env.vault.distribute_yield(), yield_amount);
+    let events = test_env
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&test_env.vault.address);
+    assert_eq!(
+        TokenClient::new(&test_env.env, &test_env.token).balance(&recipient),
+        yield_amount
+    );
+    assert_eq!(test_env.vault.get_yield_info().harvested_yield, 0);
+
+    let expected = refund_vault::strategy::YieldDistributedEvent {
+        recipient,
+        amount: yield_amount,
+        nonce: 3,
+    }
+    .to_xdr(&test_env.env, &test_env.vault.address);
+    assert_eq!(events.events()[0], expected);
+}
+
+#[test]
+fn distribute_errors_are_specific() {
+    let test_env = setup();
+    assert_eq!(
+        test_env.vault.try_distribute_yield(),
+        Err(Ok(accensa_common::Error::NothingToHarvest))
+    );
+
+    let strategy = register_strategy(&test_env);
+    let yield_amount = 12_000i128;
+    test_env.vault.deposit(&test_env.merchant, &200_000, &None);
+    test_env.vault.deploy_to_yield(&200_000);
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy).simulate_yield(&yield_amount);
+    StellarAssetClient::new(&test_env.env, &test_env.token).mint(&strategy, &yield_amount);
+    test_env.vault.harvest_yield();
+
+    let destination = Address::generate(&test_env.env);
+    test_env.vault.withdraw(&yield_amount, &destination);
+    assert_eq!(
+        test_env.vault.try_distribute_yield(),
+        Err(Ok(accensa_common::Error::InsufficientFloat))
+    );
+    assert_eq!(
+        test_env.vault.get_yield_info().harvested_yield,
+        yield_amount
+    );
+}
+
+#[test]
+fn distribute_is_rejected_while_paused() {
+    let test_env = setup();
+    let strategy = register_strategy(&test_env);
+    let yield_amount = 8_000i128;
+
+    test_env.vault.deposit(&test_env.merchant, &100_000, &None);
+    test_env.vault.deploy_to_yield(&100_000);
+    IntegrationYieldStrategyClient::new(&test_env.env, &strategy).simulate_yield(&yield_amount);
+    StellarAssetClient::new(&test_env.env, &test_env.token).mint(&strategy, &yield_amount);
+    test_env.vault.harvest_yield();
+    test_env.vault.pause();
+
+    assert_eq!(
+        test_env.vault.try_distribute_yield(),
+        Err(Ok(accensa_common::Error::Paused))
+    );
+    assert_eq!(
+        test_env.vault.get_yield_info().harvested_yield,
+        yield_amount
+    );
 }
